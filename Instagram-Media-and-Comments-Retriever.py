@@ -1,119 +1,87 @@
-import os
 import instaloader
-import pytesseract
+import csv
+import torch
+import time
+from PIL import Image
 import cv2
-from pydub import AudioSegment
-import speech_recognition as sr
-import pandas as pd
+import pytesseract
+from transformers import BlipProcessor, BlipForConditionalGeneration
 
-# function to download media and extract audio/image
-def download_ig_post_with_audio(post_url, username, download_dir):
+#function to get Instagram comments and caption
+def get_ig_comments(post_url, username, image_path):
     L = instaloader.Instaloader()
+    # load insta session 
     L.load_session_from_file(username, f"/Users/rubinaalmas/.config/instaloader/session-{username}")
+    
     shortcode = post_url.split("/")[-2]
     post = instaloader.Post.from_shortcode(L.context, shortcode)
 
-    #create a directory for downloads
-    os.makedirs(download_dir, exist_ok=True)
-
-    #download media (image and audio as video)
-    media_path = None
-    try:
-        for resource in post.get_sidecar_nodes():
-            is_video = resource.get("is_video", False)
-            ext = ".mp4" if is_video else ".jpg"
-            media_url = resource["video_url"] if is_video else resource["display_url"]
-            media_path = os.path.join(download_dir, f"{shortcode}{ext}")
-            L.download_pic(media_path, media_url, post.date_utc)
-            break 
-    except Exception as e:
-        print(f"Error while downloading media: {e}")
-        return None, "No caption"
-
+    #fetch the post caption
     caption = post.caption if post.caption else "No caption"
-    return media_path, caption
+    
+    comments_data = []
+    for count, comment in enumerate(post.get_comments()):
+        comments_data.append((comment.owner.username, comment.text, caption))
 
+        #stop if we reach 1000 comments
+        if len(comments_data) >= 1000:
+            break
+        
+        #pause after every 100 comments
+        if (count + 1) % 100 == 0:
+            time.sleep(60)
 
-#function to process image for OCR text
+    #OCR and BLIP text for the associated image
+    ocr_text = process_image_for_description(image_path)
+    blip_text = process_image_for_blip_description(image_path)
+
+    return comments_data, ocr_text, blip_text
+
+#function to extract OCR text using pytesseract
 def process_image_for_description(image_path):
+    """Extract and clean text from image using Tesseract OCR."""
     image = cv2.imread(image_path)
     if image is None:
         return "Error: Unable to load image."
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.medianBlur(gray, 5)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    raw_text = pytesseract.image_to_string(thresh, config='--oem 3 --psm 6')
-    return raw_text.strip() if raw_text.strip() else "No readable text found in the image."
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    inverted = cv2.bitwise_not(thresh)
 
-#function to extract and transcribe audio
-def audio_to_text(audio_path):
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(audio_path) as source:
-        audio_data = recognizer.record(source)
+    custom_config = r'--oem 3 --psm 6'
+    raw_text = pytesseract.image_to_string(inverted, config=custom_config)
+
+    return raw_text if raw_text.strip() else "No readable text found in the image."
+
+#function to generate BLIP description for image
+def process_image_for_blip_description(image_path):
+    """Generate a caption for the image using the BLIP model."""
     try:
-        return recognizer.recognize_google(audio_data)
-    except sr.UnknownValueError:
-        return "Sorry, I couldn't understand the audio."
-    except sr.RequestError:
-        return "Sorry, I'm unable to reach the speech recognition service."
-
-# function to convert video (mp4) to audio (wav)
-def extract_audio_from_video(video_path, output_audio_path):
-    audio = AudioSegment.from_file(video_path, format="mp4")
-    audio.export(output_audio_path, format="wav")
-    return output_audio_path
-
-# function to fetch comments and usernames (Placeholder implementation)
-def fetch_comments_and_usernames(post_url, username):
-    # Use Instaloader or Instagram Graph API for this.
-    # Placeholder data
-    comments = ["This is a great post!", "Amazing content!", "Love this!"]
-    usernames = ["user1", "user2", "user3"]
-    return list(zip(usernames, comments))
-
-# main Integration
-def integrate_photo_and_audio(post_url, username, output_csv, download_dir="ig_media"):
-    media_path, caption = download_ig_post_with_audio(post_url, username, download_dir)
-
-    if media_path is None:
-        print("No media was found for the given post URL.")
-        return
-
-    # process media
-    ocr_text, audio_text = None, None
-    try:
-        if media_path.endswith(".jpg"):
-            ocr_text = process_image_for_description(media_path)
-        elif media_path.endswith(".mp4"):
-            audio_path = os.path.join(download_dir, "extracted_audio.wav")
-            extract_audio_from_video(media_path, audio_path)
-            audio_text = audio_to_text(audio_path)
+        image = Image.open(image_path)
     except Exception as e:
-        print(f"Error while processing media: {e}")
+        return f"Error: Unable to load image. {str(e)}"
 
-    # fetch comments and usernames
-    comments_and_usernames = fetch_comments_and_usernames(post_url, username)
+    inputs = processor(images=image, return_tensors="pt")
+    with torch.no_grad():
+        out = caption_model.generate(**inputs)
+    description = processor.decode(out[0], skip_special_tokens=True)
+    return description
 
-    # combine data
-    data = []
-    for user, comment in comments_and_usernames:
-        data.append({
-            "audio_from_text": audio_text,
-            "ocr_text": ocr_text,
-            "username": user,
-            "comment": comment,
-            "caption": caption
-        })
+#initialize BLIP processor and model
+processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
 
-    
-    df = pd.DataFrame(data)
-    df.to_csv(output_csv, index=False)
-    print(f"Data integrated and saved to {output_csv}")
+post_url = "URL"
+username = "USERNAME OF INSTAGRAM"
+image_path = "DOWNLOAD IMAGE FROM INSTA POST AND PUT THE PATH HERE"  # Replace with your image path
 
-# Example Usage
-post_url = "post url"
-username = "username"
-output_csv = "final_output.csv"
+comments_data, ocr_text, blip_text = get_ig_comments(post_url, username, image_path)
 
-integrate_photo_and_audio(post_url, username, output_csv)
+output_file = "Name your output file here"
+with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
+    writer = csv.writer(csvfile)
+    writer.writerow(["OCR_Text", "Username", "Comment", "Caption", "BLIP_Text"])
+    for user, comment, caption in comments_data:
+        writer.writerow([ocr_text, user, comment, caption, blip_text])
+
+print(f"Data saved to {output_file}")
